@@ -9,6 +9,12 @@
  *
  *  Read-only against your lead spreadsheets. Nothing is ever written to them.
  *
+ *  Handles folders too large to scan in one go: set RESUMABLE to true and the
+ *  script checkpoints its progress, schedules itself to continue a minute
+ *  later, and keeps going until the whole folder is scanned. Results are only
+ *  written once every spreadsheet has been read, so a half-finished scan can
+ *  never mark an already-contacted domain as NEW.
+ *
  *  Setup: fill in the CONFIG block below, then run checkNewDomains()
  *         (or use the "Domain Cleaner" menu that appears in the spreadsheet).
  * ============================================================================
@@ -50,6 +56,30 @@ const CONFIG = {
   // Scan Google Sheets in sub-folders of FOLDER_ID as well.
   INCLUDE_SUBFOLDERS: false,
 
+  // --- Big folders: automatic resume -------------------------------------
+  // Google stops any single Apps Script run at about 6 minutes. With
+  // RESUMABLE turned on, the script scans for RUN_BUDGET_MS, saves its place,
+  // schedules itself to continue, and repeats until the folder is finished.
+  // Leave it false if your folder scans comfortably in one run.
+  RESUMABLE: false,
+
+  // Scanning time per run. The remainder of the 6 minutes is left free for
+  // saving the checkpoint and, on the final run, writing the results.
+  RUN_BUDGET_MS: 4 * 60 * 1000,
+
+  // How long to wait before the next run in the chain. 1 is the minimum.
+  RESUME_DELAY_MINUTES: 1,
+
+  // Safety stop: give up after this many runs in one chain rather than
+  // scheduling triggers forever. 12 runs is roughly an hour of scanning.
+  MAX_RESUME_RUNS: 12,
+
+  // Abandon a checkpoint older than this and start fresh, so an interrupted
+  // chain can never resume days later against stale data.
+  CHECKPOINT_MAX_AGE_MS: 6 * 60 * 60 * 1000,
+
+  // --- Tuning (safe to leave alone) --------------------------------------
+
   // Rows read per batch call. Lower this only if you hit memory errors.
   READ_CHUNK_ROWS: 20000,
 
@@ -57,25 +87,26 @@ const CONFIG = {
   WRITE_CHUNK_ROWS: 5000,
 
   // Max spreadsheet names listed in the found_in cell before it is truncated.
-  MAX_FOUND_IN_LISTED: 25,
-
-  // Apps Script kills a script at 6 minutes. If indexing is still running
-  // after this many milliseconds we stop with a clear message instead of
-  // producing a half-scanned (and therefore unsafe) result.
-  MAX_INDEXING_MS: 5 * 60 * 1000
+  MAX_FOUND_IN_LISTED: 25
 };
 
 
 /* ============================================================================
- *  STATUS VALUES
+ *  CONSTANTS
  * ==========================================================================*/
 
 const STATUS = {
-  DUPLICATE: "DUPLICATE",              // already exists in the Drive folder
-  DUPLICATE_IN_LIST: "DUPLICATE IN LIST", // not in the folder, but repeated in the new list
-  NEW: "NEW",                          // safe to contact
-  INVALID: "INVALID"                   // cell had something that is not a domain
+  DUPLICATE: "DUPLICATE",                 // already exists in the Drive folder
+  DUPLICATE_IN_LIST: "DUPLICATE IN LIST", // not in the folder, repeated in the new list
+  NEW: "NEW",                             // safe to contact
+  INVALID: "INVALID"                      // cell held something that is not a domain
 };
+
+// PropertiesService keys used to track an in-progress scan.
+const PROP_CHECKPOINT_FILE = "DOMAIN_CLEANER_CHECKPOINT_FILE_ID";
+const PROP_RESUME_TRIGGER = "DOMAIN_CLEANER_RESUME_TRIGGER_ID";
+
+const CHECKPOINT_FILE_NAME = "domain-cleaner-checkpoint.json";
 
 
 /* ============================================================================
@@ -89,6 +120,8 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("Domain Cleaner")
     .addItem("Check new domains", "checkNewDomains")
+    .addSeparator()
+    .addItem("Cancel a running scan", "cancelRun")
     .addToUi();
 }
 
@@ -98,12 +131,30 @@ function onOpen() {
  * ==========================================================================*/
 
 /**
- * Entry point. Scans the Drive folder once, builds an in-memory index of every
- * existing domain, then checks the new domain list against it.
+ * Entry point. Safe to call from the menu, the editor, or a trigger.
+ * A script lock keeps a scheduled run from colliding with a manual one.
  */
 function checkNewDomains() {
-  const startedAt = Date.now();
-  Logger.log("=== Domain Cleaner started ===");
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    Logger.log("Another Domain Cleaner run is already in progress — skipping this one.");
+    return;
+  }
+  try {
+    runCheck_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * One run of the check. Scans as much of the folder as fits in the time
+ * budget; either finishes and writes results, or checkpoints and reschedules.
+ */
+function runCheck_() {
+  const runStartedAt = Date.now();
+  const deadline = runStartedAt + CONFIG.RUN_BUDGET_MS;
 
   const targetSs = openNewDomainsSpreadsheet_();
   const input = readNewDomains_(targetSs);
@@ -115,142 +166,159 @@ function checkNewDomains() {
     notify_("Domain Cleaner", msg);
     return;
   }
-  Logger.log("Read " + fmt_(input.rows.length) + " non-empty domain cells from the new list.");
 
-  // Never scan the new-domains spreadsheet itself, even if it lives in the folder.
-  const index = buildDomainIndex_(CONFIG.FOLDER_ID, targetSs.getId());
+  const fingerprint = fingerprintNewDomains_(input.rows);
+  const checkpoint = resolveCheckpoint_(fingerprint, targetSs.getId());
 
-  const results = compareAgainstIndex_(input.rows, index);
+  if (checkpoint.chunk === 1) {
+    Logger.log("=== Domain Cleaner started ===");
+    Logger.log("Read " + fmt_(input.rows.length) + " non-empty domain cells from the new list.");
+    Logger.log(fmt_(checkpoint.files.length) + " Google Sheets to scan.");
+  } else {
+    Logger.log("=== Domain Cleaner resuming (run " + checkpoint.chunk + " of at most " +
+               CONFIG.MAX_RESUME_RUNS + ") ===");
+    Logger.log("Resuming at spreadsheet " + (checkpoint.cursor + 1) + " of " +
+               fmt_(checkpoint.files.length) + ".");
+  }
+
+  // Only the new domains need to be recognised, so the scan records matches
+  // instead of every existing domain. Memory and the checkpoint stay small
+  // no matter how many domains sit in the folder.
+  const targets = new Set();
+  for (let i = 0; i < input.rows.length; i++) {
+    if (input.rows[i].domain) targets.add(input.rows[i].domain);
+  }
+
+  const matches = new Map(checkpoint.matches);
+  const finished = scanFiles_(checkpoint, matches, targets, deadline);
+
+  if (!finished) {
+    checkpoint.matches = mapToPairs_(matches);
+    saveCheckpoint_(checkpoint);
+    scheduleResume_();
+    const progress = "Paused after " + fmt_(checkpoint.cursor) + " of " +
+                     fmt_(checkpoint.files.length) + " spreadsheets (" +
+                     percent_(checkpoint.cursor, checkpoint.files.length) +
+                     "). Continuing in " + CONFIG.RESUME_DELAY_MINUTES + " min.";
+    Logger.log(progress);
+    notify_("Domain Cleaner — still scanning", progress);
+    return;
+  }
+
+  const results = compareAgainstMatches_(input.rows, matches, checkpoint.files);
 
   writeResultsSheet_(targetSs, results.rows);
   if (CONFIG.WRITE_STATUS_NEXT_TO_INPUT) {
     writeStatusNextToInput_(input, results.rows);
   }
 
-  const summary = buildSummary_(results, index, input, Date.now() - startedAt);
+  clearCheckpoint_();
+  cancelResume_();
+
+  const summary = buildSummary_(results, checkpoint, input, Date.now() - checkpoint.chainStartedAt);
   Logger.log(summary);
   notify_("Domain Cleaner — finished", summary);
 }
 
 
+/**
+ * Clears any in-progress scan and cancels its scheduled continuation.
+ * Does not touch a daily trigger created by createDailyTrigger().
+ */
+function cancelRun() {
+  cancelResume_();
+  clearCheckpoint_();
+  const msg = "Any in-progress scan has been cancelled. The next run starts from scratch.";
+  Logger.log(msg);
+  notify_("Domain Cleaner", msg);
+}
+
+
 /* ============================================================================
- *  STEP 1 — INDEX EVERY EXISTING DOMAIN IN THE DRIVE FOLDER
+ *  SCANNING
  * ==========================================================================*/
 
 /**
- * Walks the Drive folder once and builds a lookup of every normalized domain.
+ * Scans spreadsheets from the checkpoint cursor onwards until the folder is
+ * finished or the deadline is reached.
  *
- * The lookup is a Map<domain, "0,3,7"> where the numbers are indexes into
- * sourceNames. Storing small index strings instead of name arrays keeps memory
- * flat when there are hundreds of thousands of domains.
+ * A spreadsheet's matches are merged only once it has been read completely,
+ * so a run that stops early never leaves half a spreadsheet recorded.
  *
- * @param {string} folderId Drive folder to scan.
- * @param {string} skipSpreadsheetId Spreadsheet to ignore (the new domain list).
- * @return {{map: !Map, sourceNames: !Array<string>, filesScanned: number,
- *           tabsScanned: number, errors: !Array<string>, startedAt: number}}
+ * @param {!Object} checkpoint Mutated: cursor and stats advance as files finish.
+ * @param {!Map<string, string>} matches domain -> "0,3,7" indexes into checkpoint.files.
+ * @param {!Set<string>} targets Normalized domains we are looking for.
+ * @param {number} deadline Timestamp to stop scanning at.
+ * @return {boolean} True if every spreadsheet has now been scanned.
  */
-function buildDomainIndex_(folderId, skipSpreadsheetId) {
-  if (!folderId || folderId === "PASTE_FOLDER_ID_HERE") {
-    throw new Error('CONFIG.FOLDER_ID is not set. Open the script and paste your Drive folder ID.');
-  }
+function scanFiles_(checkpoint, matches, targets, deadline) {
+  while (checkpoint.cursor < checkpoint.files.length) {
 
-  let rootFolder;
-  try {
-    rootFolder = DriveApp.getFolderById(folderId);
-  } catch (e) {
-    throw new Error('Could not open the Drive folder "' + folderId + '". ' +
-                    'Check the ID and make sure your account has access. (' + e.message + ')');
-  }
-
-  const index = {
-    map: new Map(),
-    sourceNames: [],
-    filesScanned: 0,
-    tabsScanned: 0,
-    errors: [],
-    startedAt: Date.now()
-  };
-
-  Logger.log('Scanning Drive folder: "' + rootFolder.getName() + '"' +
-             (CONFIG.INCLUDE_SUBFOLDERS ? " (including sub-folders)" : ""));
-
-  const folders = [rootFolder];
-  while (folders.length > 0) {
-    const folder = folders.shift();
-
-    const files = folder.getFilesByType(MimeType.GOOGLE_SHEETS);
-    while (files.hasNext()) {
-      const file = files.next();
-      if (file.getId() === skipSpreadsheetId) {
-        Logger.log('Skipping "' + file.getName() + '" (this is the new-domains spreadsheet).');
-        continue;
+    if (Date.now() >= deadline) {
+      if (!CONFIG.RESUMABLE) {
+        throw new Error(
+          "Stopped after " + Math.round(CONFIG.RUN_BUDGET_MS / 1000) + "s having scanned " +
+          checkpoint.cursor + " of " + checkpoint.files.length + " spreadsheets. Google stops " +
+          "any run at about 6 minutes, and a partial scan would wrongly mark already-contacted " +
+          'domains as NEW. Set RESUMABLE: true in CONFIG to have the script save its place and ' +
+          "continue automatically, or split the folder and run the check once per folder."
+        );
       }
-      scanOneSpreadsheet_(file, index);
+      return false; // checkpoint and resume
     }
 
-    if (CONFIG.INCLUDE_SUBFOLDERS) {
-      const subFolders = folder.getFolders();
-      while (subFolders.hasNext()) {
-        folders.push(subFolders.next());
+    const file = checkpoint.files[checkpoint.cursor];
+    const fileMatches = new Map();
+    let domainsSeen = 0;
+    let tabsSeen = 0;
+
+    try {
+      Logger.log("Scanning spreadsheet: " + file.name);
+      const sheets = SpreadsheetApp.openById(file.id).getSheets();
+
+      for (let s = 0; s < sheets.length; s++) {
+        tabsSeen++;
+        try {
+          domainsSeen += readDomainColumns_(sheets[s], function (domain) {
+            if (targets.has(domain)) fileMatches.set(domain, true);
+          });
+        } catch (tabErr) {
+          const msg = file.name + ' → tab "' + sheets[s].getName() + '": ' + tabErr.message;
+          checkpoint.errors.push(msg);
+          Logger.log("  ERROR " + msg);
+        }
       }
+
+      Logger.log("  Found " + fmt_(domainsSeen) + " domains, " +
+                 fmt_(fileMatches.size) + " of them on your new list");
+
+    } catch (err) {
+      const msg = file.name + ": " + err.message;
+      checkpoint.errors.push(msg);
+      Logger.log("  ERROR — could not open " + msg + " (continuing)");
     }
+
+    // The spreadsheet is done: fold its matches in and advance past it.
+    const sourceIdx = String(checkpoint.cursor);
+    const matchedDomains = Array.from(fileMatches.keys());
+    for (let m = 0; m < matchedDomains.length; m++) {
+      addSource_(matches, matchedDomains[m], sourceIdx);
+    }
+    checkpoint.domainsScanned += domainsSeen;
+    checkpoint.tabsScanned += tabsSeen;
+    checkpoint.cursor++;
   }
 
-  Logger.log("Finished. " + fmt_(index.filesScanned) + " spreadsheets scanned, " +
-             fmt_(index.tabsScanned) + " tabs, " + fmt_(index.map.size) +
-             " unique existing domains indexed.");
-  return index;
+  Logger.log("Finished. " + fmt_(checkpoint.files.length) + " spreadsheets scanned, " +
+             fmt_(checkpoint.tabsScanned) + " tabs, " + fmt_(checkpoint.domainsScanned) +
+             " domain cells read.");
+  return true;
 }
 
 
 /**
- * Reads every domain column of every tab of one spreadsheet into the index.
- * Failures are logged and swallowed so one broken file cannot stop the run.
- *
- * @param {!DriveApp.File} file
- * @param {!Object} index
- */
-function scanOneSpreadsheet_(file, index) {
-  const name = file.getName();
-  checkTimeBudget_(index.startedAt, name);
-
-  let found = 0;
-  const sourceIdx = index.sourceNames.length;
-
-  try {
-    Logger.log("Scanning spreadsheet: " + name);
-    const ss = SpreadsheetApp.openById(file.getId());
-    const sheets = ss.getSheets();
-
-    for (let s = 0; s < sheets.length; s++) {
-      const sheet = sheets[s];
-      index.tabsScanned++;
-      try {
-        found += readDomainColumns_(sheet, function (domain) {
-          addToIndex_(index, domain, sourceIdx);
-        });
-      } catch (tabErr) {
-        const msg = name + " → tab \"" + sheet.getName() + "\": " + tabErr.message;
-        index.errors.push(msg);
-        Logger.log("  ERROR " + msg);
-      }
-    }
-
-    index.sourceNames.push(name);
-    index.filesScanned++;
-    Logger.log("  Found " + fmt_(found) + " domains");
-
-  } catch (err) {
-    const msg = name + ": " + err.message;
-    index.errors.push(msg);
-    Logger.log("  ERROR — could not open " + msg + " (continuing)");
-  }
-}
-
-
-/**
- * Finds every column in a tab whose header is a domain header and streams the
- * normalized values to a callback. Reads in batches, never cell by cell.
+ * Reads every domain column of a tab and streams normalized values to a
+ * callback. Reads in batches, never cell by cell.
  *
  * @param {!Sheet} sheet
  * @param {function(string)} onDomain Called once per non-empty, valid domain.
@@ -311,44 +379,253 @@ function findDomainColumns_(headerRow) {
 /**
  * Records that a domain was seen in the spreadsheet at sourceIdx.
  *
- * @param {!Object} index
+ * @param {!Map<string, string>} matches
  * @param {string} domain Already normalized.
- * @param {number} sourceIdx
+ * @param {string} sourceIdx
  */
-function addToIndex_(index, domain, sourceIdx) {
-  const existing = index.map.get(domain);
+function addSource_(matches, domain, sourceIdx) {
+  const existing = matches.get(domain);
   if (existing === undefined) {
-    index.map.set(domain, String(sourceIdx));
+    matches.set(domain, sourceIdx);
     return;
   }
-  const key = String(sourceIdx);
-  const parts = existing.split(",");
-  if (parts.indexOf(key) === -1) {
-    index.map.set(domain, existing + "," + key);
+  if (existing.split(",").indexOf(sourceIdx) === -1) {
+    matches.set(domain, existing + "," + sourceIdx);
   }
 }
 
 
 /**
- * Stops with a helpful message rather than letting Apps Script kill the run
- * mid-scan, which would produce dangerously incomplete "NEW" results.
+ * Lists every Google Sheet in the folder, once, so the scan works from a
+ * stable file list even when it spans several runs.
  *
- * @param {number} startedAt
- * @param {string} currentFile
+ * @param {string} folderId
+ * @param {string} skipSpreadsheetId Excluded so the new list cannot match itself.
+ * @return {!Array<{id: string, name: string}>}
  */
-function checkTimeBudget_(startedAt, currentFile) {
-  if (Date.now() - startedAt < CONFIG.MAX_INDEXING_MS) return;
-  throw new Error(
-    "Stopped after " + Math.round((Date.now() - startedAt) / 1000) + "s while scanning \"" +
-    currentFile + "\". Apps Script allows about 6 minutes per run, and a partial scan " +
-    "would wrongly mark existing domains as NEW. Split the lead spreadsheets across two " +
-    "folders and run the check once per folder, or archive older sheets."
-  );
+function listSpreadsheets_(folderId, skipSpreadsheetId) {
+  if (!folderId || folderId === "PASTE_FOLDER_ID_HERE") {
+    throw new Error("CONFIG.FOLDER_ID is not set. Open the script and paste your Drive folder ID.");
+  }
+
+  let rootFolder;
+  try {
+    rootFolder = DriveApp.getFolderById(folderId);
+  } catch (e) {
+    throw new Error('Could not open the Drive folder "' + folderId + '". ' +
+                    "Check the ID and make sure your account has access. (" + e.message + ")");
+  }
+
+  Logger.log('Listing Google Sheets in folder: "' + rootFolder.getName() + '"' +
+             (CONFIG.INCLUDE_SUBFOLDERS ? " (including sub-folders)" : ""));
+
+  const out = [];
+  const folders = [rootFolder];
+  while (folders.length > 0) {
+    const folder = folders.shift();
+
+    const files = folder.getFilesByType(MimeType.GOOGLE_SHEETS);
+    while (files.hasNext()) {
+      const file = files.next();
+      if (file.getId() === skipSpreadsheetId) {
+        Logger.log('Skipping "' + file.getName() + '" (this is the new-domains spreadsheet).');
+        continue;
+      }
+      out.push({ id: file.getId(), name: file.getName() });
+    }
+
+    if (CONFIG.INCLUDE_SUBFOLDERS) {
+      const subFolders = folder.getFolders();
+      while (subFolders.hasNext()) folders.push(subFolders.next());
+    }
+  }
+
+  if (out.length === 0) {
+    throw new Error('No Google Sheets found in folder "' + rootFolder.getName() +
+                    '". Check CONFIG.FOLDER_ID' +
+                    (CONFIG.INCLUDE_SUBFOLDERS ? "." : ", or set INCLUDE_SUBFOLDERS: true."));
+  }
+  return out;
 }
 
 
 /* ============================================================================
- *  STEP 2 — READ THE NEW DOMAIN LIST
+ *  CHECKPOINTS — surviving the 6 minute limit
+ * ==========================================================================*/
+
+/**
+ * Returns the checkpoint to work from: a saved one when a chain is genuinely
+ * in progress, otherwise a fresh one.
+ *
+ * A saved checkpoint is discarded when the new domain list has changed under
+ * it, or when it is too old to trust. Both would otherwise produce a result
+ * built partly from a scan of a different question.
+ *
+ * @param {string} fingerprint Of the current new-domain list.
+ * @param {string} skipSpreadsheetId
+ * @return {!Object}
+ */
+function resolveCheckpoint_(fingerprint, skipSpreadsheetId) {
+  const saved = CONFIG.RESUMABLE ? loadCheckpoint_() : null;
+
+  if (saved) {
+    if (saved.fingerprint !== fingerprint) {
+      Logger.log("The new-domain list changed since the last run — discarding the saved " +
+                 "progress and starting a fresh scan.");
+      clearCheckpoint_();
+    } else if (Date.now() - saved.chainStartedAt > CONFIG.CHECKPOINT_MAX_AGE_MS) {
+      Logger.log("Saved progress is older than " +
+                 Math.round(CONFIG.CHECKPOINT_MAX_AGE_MS / 3600000) +
+                 "h — discarding it and starting a fresh scan.");
+      clearCheckpoint_();
+    } else if (saved.chunk >= CONFIG.MAX_RESUME_RUNS) {
+      clearCheckpoint_();
+      cancelResume_();
+      throw new Error(
+        "Gave up after " + CONFIG.MAX_RESUME_RUNS + " runs with " +
+        (saved.files.length - saved.cursor) + " of " + saved.files.length +
+        " spreadsheets still unscanned. Raise CONFIG.MAX_RESUME_RUNS, or split the folder."
+      );
+    } else {
+      saved.chunk++;
+      return saved;
+    }
+  }
+
+  return {
+    chunk: 1,
+    chainStartedAt: Date.now(),
+    fingerprint: fingerprint,
+    files: listSpreadsheets_(CONFIG.FOLDER_ID, skipSpreadsheetId),
+    cursor: 0,
+    matches: [],
+    errors: [],
+    tabsScanned: 0,
+    domainsScanned: 0
+  };
+}
+
+
+/**
+ * @return {?Object} The saved checkpoint, or null if there is none.
+ */
+function loadCheckpoint_() {
+  const fileId = PropertiesService.getScriptProperties().getProperty(PROP_CHECKPOINT_FILE);
+  if (!fileId) return null;
+  try {
+    return JSON.parse(DriveApp.getFileById(fileId).getBlob().getDataAsString());
+  } catch (e) {
+    Logger.log("Could not read the saved progress (" + e.message + ") — starting fresh.");
+    clearCheckpoint_();
+    return null;
+  }
+}
+
+
+/**
+ * Writes the checkpoint to a small JSON file in Drive. Script Properties cap
+ * out at 9KB per value, which the match list can exceed, so the file holds the
+ * data and Properties just remembers its ID.
+ *
+ * @param {!Object} checkpoint
+ */
+function saveCheckpoint_(checkpoint) {
+  const props = PropertiesService.getScriptProperties();
+  const json = JSON.stringify(checkpoint);
+  const existingId = props.getProperty(PROP_CHECKPOINT_FILE);
+
+  if (existingId) {
+    try {
+      DriveApp.getFileById(existingId).setContent(json);
+      return;
+    } catch (e) {
+      Logger.log("Could not update the progress file (" + e.message + ") — creating a new one.");
+    }
+  }
+  const file = DriveApp.createFile(CHECKPOINT_FILE_NAME, json, MimeType.PLAIN_TEXT);
+  props.setProperty(PROP_CHECKPOINT_FILE, file.getId());
+}
+
+
+/**
+ * Deletes the checkpoint file and forgets it.
+ */
+function clearCheckpoint_() {
+  const props = PropertiesService.getScriptProperties();
+  const fileId = props.getProperty(PROP_CHECKPOINT_FILE);
+  if (fileId) {
+    try {
+      DriveApp.getFileById(fileId).setTrashed(true);
+    } catch (e) {
+      Logger.log("Could not remove the progress file (" + e.message + ").");
+    }
+  }
+  props.deleteProperty(PROP_CHECKPOINT_FILE);
+}
+
+
+/**
+ * Schedules the next run in the chain, replacing any earlier one.
+ */
+function scheduleResume_() {
+  cancelResume_();
+  const trigger = ScriptApp.newTrigger("checkNewDomains")
+    .timeBased()
+    .after(Math.max(1, CONFIG.RESUME_DELAY_MINUTES) * 60 * 1000)
+    .create();
+  PropertiesService.getScriptProperties().setProperty(PROP_RESUME_TRIGGER, trigger.getUniqueId());
+}
+
+
+/**
+ * Cancels a pending continuation. Matches on the stored trigger ID so a daily
+ * trigger for the same function is never removed by accident.
+ */
+function cancelResume_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty(PROP_RESUME_TRIGGER);
+  if (!id) return;
+
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getUniqueId() === id) {
+      ScriptApp.deleteTrigger(triggers[i]);
+      break;
+    }
+  }
+  props.deleteProperty(PROP_RESUME_TRIGGER);
+}
+
+
+/**
+ * A cheap signature of the new-domain list, used to notice that the list was
+ * edited part-way through a multi-run scan.
+ *
+ * @param {!Array<!Object>} rows
+ * @return {string}
+ */
+function fingerprintNewDomains_(rows) {
+  let hash = 5381;
+  for (let i = 0; i < rows.length; i++) {
+    const d = rows[i].domain;
+    for (let c = 0; c < d.length; c++) {
+      hash = ((hash * 33) ^ d.charCodeAt(c)) | 0; // djb2, kept in int32
+    }
+  }
+  return rows.length + ":" + (hash >>> 0).toString(36);
+}
+
+
+/** @return {!Array<!Array<string>>} A Map as [key, value] pairs for JSON. */
+function mapToPairs_(map) {
+  const out = [];
+  map.forEach(function (value, key) { out.push([key, value]); });
+  return out;
+}
+
+
+/* ============================================================================
+ *  READING THE NEW DOMAIN LIST
  * ==========================================================================*/
 
 /**
@@ -367,7 +644,7 @@ function openNewDomainsSpreadsheet_() {
   try {
     return SpreadsheetApp.openById(id);
   } catch (e) {
-    throw new Error('Could not open the new-domains spreadsheet "' + id + '". (' + e.message + ')');
+    throw new Error('Could not open the new-domains spreadsheet "' + id + '". (' + e.message + ")");
   }
 }
 
@@ -396,7 +673,7 @@ function readNewDomains_(ss) {
   const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
   const columns = findDomainColumns_(headers);
   if (columns.length === 0) {
-    throw new Error('No column named ' + CONFIG.DOMAIN_HEADERS.join(" or ") + ' was found in row 1 of "' +
+    throw new Error("No column named " + CONFIG.DOMAIN_HEADERS.join(" or ") + ' was found in row 1 of "' +
                     sheet.getName() + '". Add a header cell named "' + CONFIG.DOMAIN_HEADERS[0] + '".');
   }
   if (columns.length > 1) {
@@ -429,17 +706,19 @@ function readNewDomains_(ss) {
 
 
 /* ============================================================================
- *  STEP 3 — COMPARE
+ *  COMPARING
  * ==========================================================================*/
 
 /**
- * Checks every new domain against the index and against the rest of the list.
+ * Turns the scan's matches into one result row per new domain, and flags
+ * domains that repeat inside the new list itself.
  *
  * @param {!Array<!Object>} newRows
- * @param {!Object} index
+ * @param {!Map<string, string>} matches
+ * @param {!Array<{name: string}>} files
  * @return {{rows: !Array<!Array<*>>, counts: !Object, uniqueNew: number}}
  */
-function compareAgainstIndex_(newRows, index) {
+function compareAgainstMatches_(newRows, matches, files) {
   // Which rows of the new list share each normalized domain.
   const occurrences = new Map();
   for (let i = 0; i < newRows.length; i++) {
@@ -465,7 +744,7 @@ function compareAgainstIndex_(newRows, index) {
       foundIn = "Not a valid domain";
       counts.invalid++;
     } else {
-      const sources = index.map.get(item.domain);
+      const sources = matches.get(item.domain);
       const repeats = occurrences.get(item.domain);
       const isRepeat = repeats.length > 1;
 
@@ -475,7 +754,7 @@ function compareAgainstIndex_(newRows, index) {
 
       if (sources !== undefined) {
         status = STATUS.DUPLICATE;
-        foundIn = resolveSourceNames_(sources, index.sourceNames);
+        foundIn = resolveSourceNames_(sources, files);
         counts.duplicate++;
       } else if (isRepeat && seen.has(item.domain)) {
         status = STATUS.DUPLICATE_IN_LIST;
@@ -500,14 +779,14 @@ function compareAgainstIndex_(newRows, index) {
  * Turns "0,3,7" into "Leads January, Apollo SaaS, Old Leads".
  *
  * @param {string} sources
- * @param {!Array<string>} sourceNames
+ * @param {!Array<{name: string}>} files
  * @return {string}
  */
-function resolveSourceNames_(sources, sourceNames) {
+function resolveSourceNames_(sources, files) {
   const idxs = sources.split(",");
   const names = [];
   for (let i = 0; i < idxs.length && i < CONFIG.MAX_FOUND_IN_LISTED; i++) {
-    names.push(sourceNames[Number(idxs[i])]);
+    names.push(files[Number(idxs[i])].name);
   }
   let out = names.join(", ");
   if (idxs.length > CONFIG.MAX_FOUND_IN_LISTED) {
@@ -518,7 +797,7 @@ function resolveSourceNames_(sources, sourceNames) {
 
 
 /* ============================================================================
- *  STEP 4 — NORMALIZE
+ *  NORMALIZING
  * ==========================================================================*/
 
 /**
@@ -559,7 +838,7 @@ function normalizeDomain_(value) {
 
 
 /* ============================================================================
- *  STEP 5 — WRITE RESULTS
+ *  WRITING RESULTS
  * ==========================================================================*/
 
 /**
@@ -624,7 +903,7 @@ function writeStatusNextToInput_(input, rows) {
 /**
  * @return {string} A human readable run summary.
  */
-function buildSummary_(results, index, input, elapsedMs) {
+function buildSummary_(results, checkpoint, input, elapsedMs) {
   const lines = [
     "",
     "=== SUMMARY ===",
@@ -634,15 +913,16 @@ function buildSummary_(results, index, input, elapsedMs) {
     "DUPLICATE (in folder):     " + fmt_(results.counts.duplicate),
     "DUPLICATE IN LIST:         " + fmt_(results.counts.duplicateInList),
     "Invalid values:            " + fmt_(results.counts.invalid),
-    "Google Sheets scanned:     " + fmt_(index.filesScanned),
-    "Tabs scanned:              " + fmt_(index.tabsScanned),
-    "Existing domains indexed:  " + fmt_(index.map.size),
-    "Errors:                    " + fmt_(index.errors.length),
+    "Google Sheets scanned:     " + fmt_(checkpoint.files.length),
+    "Tabs scanned:              " + fmt_(checkpoint.tabsScanned),
+    "Existing domains read:     " + fmt_(checkpoint.domainsScanned),
+    "Errors:                    " + fmt_(checkpoint.errors.length),
+    "Runs used:                 " + checkpoint.chunk,
     "Time:                      " + (elapsedMs / 1000).toFixed(1) + "s"
   ];
-  if (index.errors.length > 0) {
+  if (checkpoint.errors.length > 0) {
     lines.push("", "Errors (skipped, the rest of the scan continued):");
-    for (let i = 0; i < index.errors.length; i++) lines.push("  - " + index.errors[i]);
+    for (let i = 0; i < checkpoint.errors.length; i++) lines.push("  - " + checkpoint.errors[i]);
   }
   return lines.join("\n");
 }
@@ -675,23 +955,34 @@ function joinCapped_(list, cap) {
 }
 
 
+/** @return {string} 3 of 4 -> "75%" */
+function percent_(done, total) {
+  if (!total) return "0%";
+  return Math.floor((done / total) * 100) + "%";
+}
+
+
 /* ============================================================================
- *  OPTIONAL — automatic daily run
+ *  OPTIONAL — automatic nightly run
  * ==========================================================================*/
 
 /**
- * Run this once to schedule checkNewDomains() every day at 8am.
+ * Run this once to schedule checkNewDomains() every night at 2am.
  * Running it again replaces the existing schedule rather than stacking one up.
+ *
+ * With RESUMABLE turned on, a scan too big for one run continues itself
+ * through the night until the whole folder is done.
  */
-function createDailyTrigger() {
+function createNightlyTrigger() {
   deleteTriggers();
-  ScriptApp.newTrigger("checkNewDomains").timeBased().atHour(8).everyDays(1).create();
-  Logger.log("Daily trigger created — checkNewDomains() will run every day around 8am.");
+  ScriptApp.newTrigger("checkNewDomains").timeBased().atHour(2).everyDays(1).create();
+  Logger.log("Nightly trigger created — checkNewDomains() will run every day around 2am.");
 }
 
 
 /**
- * Removes every trigger this script created.
+ * Removes every schedule this script created, including any pending
+ * continuation, and clears an in-progress scan.
  */
 function deleteTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
@@ -700,5 +991,6 @@ function deleteTriggers() {
       ScriptApp.deleteTrigger(triggers[i]);
     }
   }
-  Logger.log("Existing checkNewDomains triggers removed.");
+  PropertiesService.getScriptProperties().deleteProperty(PROP_RESUME_TRIGGER);
+  Logger.log("All Domain Cleaner schedules removed.");
 }

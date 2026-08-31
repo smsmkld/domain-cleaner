@@ -6,6 +6,10 @@ inside a Google Drive folder**, so you never scrape or contact the same domain t
 For each new domain it tells you whether it already exists and **which spreadsheet(s)**
 it was found in. It also catches duplicates *inside* the new list itself.
 
+Folders too big to scan in one go are handled by **resumable mode**: the script saves its
+place, schedules itself to continue, and keeps going until the whole folder is read — so
+you can point it at hundreds of thousands of domains and let it run overnight.
+
 The full script is in **[`Code.gs`](Code.gs)**. Only the `CONFIG` block at the top
 needs editing.
 
@@ -56,6 +60,7 @@ Other settings you can leave alone:
 | `RESULTS_SHEET_NAME` | `"Results"` | Tab the full report is written to. Cleared and rewritten each run. |
 | `WRITE_STATUS_NEXT_TO_INPUT` | `true` | Also writes `status` / `found_in` / `duplicate_in_list` to the right of your input rows. Set to `false` to leave the input tab untouched. |
 | `INCLUDE_SUBFOLDERS` | `false` | Set to `true` to scan sub-folders of `FOLDER_ID` too. |
+| `RESUMABLE` | `false` | Turn on for folders too big to scan in one run — see [Big folders](#big-folders-200k500k-domains). |
 | `READ_CHUNK_ROWS` | `20000` | Rows per batch read. Lower it only if you hit memory errors. |
 
 ---
@@ -71,10 +76,10 @@ Open **Execution log** (`Ctrl/Cmd + Enter`) to watch progress:
 
 ```
 Scanning spreadsheet: Leads January
-  Found 12,430 domains
+  Found 12,430 domains, 84 of them on your new list
 Scanning spreadsheet: Apollo SaaS
-  Found 8,921 domains
-Finished. 47 spreadsheets scanned, 112 tabs, 84,203 unique existing domains indexed.
+  Found 8,921 domains, 31 of them on your new list
+Finished. 47 spreadsheets scanned, 112 tabs, 84,203 domain cells read.
 ```
 
 Your lead spreadsheets are only ever **read** — nothing is written back to them.
@@ -92,11 +97,11 @@ You will be asked to allow:
 - **See, edit, create, and delete all your Google Sheets spreadsheets** — to read your
   lead sheets and write the results tab.
 - **See, edit, create, and delete all of your Google Drive files** — to list the Google
-  Sheets inside the folder.
+  Sheets inside the folder, and to store the progress file in resumable mode.
 - **Display and run third-party web content in prompts and sidebars** — for the menu
   and the toast notification.
-- **Run as you, even when you are not present** — only if you set up the automatic
-  trigger in step 6.
+- **Run as you, even when you are not present** — needed for the nightly trigger and for
+  resumable mode, which schedules its own continuation.
 
 You grant these once. Nothing leaves your Google account: no external APIs, no paid
 services.
@@ -144,8 +149,9 @@ DUPLICATE IN LIST:         50
 Invalid values:            0
 Google Sheets scanned:     47
 Tabs scanned:              112
-Existing domains indexed:  84,203
+Existing domains read:     84,203
 Errors:                    2
+Runs used:                 1
 Time:                      74.3s
 ```
 
@@ -156,14 +162,82 @@ name at the end of the summary — the scan carries on through the rest.
 
 ## 6. Setting up an automatic run
 
-In the Apps Script editor, select **`createDailyTrigger`** from the function dropdown and
-press **Run** once. `checkNewDomains()` then runs every day around 8am. Running it again
-replaces the schedule instead of stacking up a second one.
+In the Apps Script editor, select **`createNightlyTrigger`** from the function dropdown
+and press **Run** once. `checkNewDomains()` then runs every night around 2am. Running it
+again replaces the schedule instead of stacking up a second one.
 
-To change the time, edit `.atHour(8)`. To stop it, run **`deleteTriggers`**. You can also
+To change the time, edit `.atHour(2)`. To stop it, run **`deleteTriggers`**. You can also
 manage schedules by hand under the **clock icon (Triggers)** in the left sidebar.
 
 Triggered runs have no UI, so read their outcome under **Executions** in the sidebar.
+
+---
+
+## Big folders (200k–500k domains)
+
+Google stops any single Apps Script run at about **6 minutes**. The domain *count* is
+almost never what runs out that clock — checking 10,000 new domains against 500,000
+existing ones takes well under a second of actual computation. What costs time is
+**opening spreadsheets**, roughly a second each. So the limit you hit is the *number of
+spreadsheets in the folder*, not how many domains they hold.
+
+Under about 100 spreadsheets you will normally finish in one run and can leave
+`RESUMABLE: false`. Beyond that, turn it on:
+
+```js
+RESUMABLE: true,
+```
+
+Then the script:
+
+1. Lists every Google Sheet in the folder **once**, so the file list stays fixed for the
+   whole job.
+2. Scans for `RUN_BUDGET_MS` (default 4 minutes), leaving the rest of the 6 minutes free.
+3. Saves its place — which spreadsheets are done, and every match found so far — to a
+   small JSON file in your Drive.
+4. Schedules itself to continue a minute later, and picks up at the next spreadsheet.
+5. Repeats until the folder is finished, then writes the results and deletes the
+   progress file.
+
+Pair it with the nightly trigger and a big folder simply finishes itself while you sleep.
+
+**Results are only written once every spreadsheet has been read.** A half-finished scan
+is never written out, because it would mark already-contacted domains as `NEW` — exactly
+the mistake this tool exists to prevent.
+
+Progress is logged each run, so you can see where it got to:
+
+```
+=== Domain Cleaner started ===
+Paused after 42 of 180 spreadsheets (23%). Continuing in 1 min.
+=== Domain Cleaner resuming (run 2 of at most 12) ===
+Resuming at spreadsheet 43 of 180.
+```
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `RUN_BUDGET_MS` | 4 min | Scanning time per run. The remaining ~2 min covers saving progress and, on the last run, writing results. |
+| `RESUME_DELAY_MINUTES` | `1` | Gap before the next run. 1 is Google's minimum. |
+| `MAX_RESUME_RUNS` | `12` | Safety stop — gives up rather than scheduling triggers forever. 12 runs is roughly an hour of scanning. Raise it for very large folders. |
+| `CHECKPOINT_MAX_AGE_MS` | 6 h | Progress older than this is abandoned, so an interrupted job can never resume days later against stale data. |
+
+**Safety rails**, all covered by the test suite:
+
+- **You edit the new list mid-scan** → the change is detected and the scan restarts from
+  the beginning, rather than answering half a question about one list and half about
+  another.
+- **Something goes wrong repeatedly** → the chain stops at `MAX_RESUME_RUNS` with an
+  error naming how many spreadsheets were left, instead of scheduling triggers forever.
+- **Your nightly trigger** → never deleted by resume cleanup; the script tracks its own
+  continuation trigger by ID.
+- **Two runs overlap** (a nightly trigger firing into a manual run) → the second one
+  backs off via a script lock instead of corrupting the shared progress.
+- **You want to stop a running job** → **Domain Cleaner → Cancel a running scan**, or run
+  `cancelRun` in the editor.
+
+One caveat worth knowing: progress is saved per *spreadsheet*, so an individual
+spreadsheet still has to be readable within one run's budget. A sheet would need millions
+of rows for that to be a problem.
 
 ---
 
@@ -195,13 +269,13 @@ Non-Sheets files (PDFs, CSVs, Docs) in the folder are ignored.
 
 ## Performance
 
-The folder is scanned **once**, into an in-memory lookup, and the new domains are then
-checked against it — no reopening a spreadsheet per domain. Reads are batched
-`getValues()` calls over whole columns, never cell by cell, and domain sources are stored
-as compact indexes so memory stays flat at hundreds of thousands of domains.
+The folder is scanned **once**, and the new domains are checked against what it finds —
+no reopening a spreadsheet per domain. Reads are batched `getValues()` calls over whole
+columns, never cell by cell.
 
-Apps Script stops any script at ~6 minutes. If indexing is still running at 5 minutes the
-script stops with an explanatory error rather than writing a half-scanned result, because
-a partial scan would mark already-contacted domains as `NEW`. If you hit that, split the
-lead spreadsheets across two folders and run the check once per folder, or archive older
-sheets. Adjust the limit with `CONFIG.MAX_INDEXING_MS`.
+The key trick is that the script never builds an index of your existing domains. It only
+needs to recognise the ~10k domains on your *new* list, so it holds those in a Set and
+records only the **hits**. Memory therefore scales with your new list, not with your
+archive — checking 10,000 new domains against 500,000 existing ones keeps roughly 2,500
+matches in memory rather than half a million, which is also what keeps the resumable
+progress file down to tens of kilobytes.
