@@ -44,13 +44,16 @@ const CONFIG = {
   // against the first row of every tab, after trimming whitespace.
   DOMAIN_HEADERS: ["domain", "domains"],
 
-  // Where the results are written (a tab in the NEW domains spreadsheet).
-  // It is cleared and rewritten on every run.
+  // Write a full report to its own tab in the NEW domains spreadsheet. The
+  // report carries every column from your input sheet across, so any extra
+  // data you keep beside the domains (company, contact, notes...) travels
+  // with the verdict. Cleared and rewritten on every run.
+  WRITE_RESULTS_SHEET: true,
   RESULTS_SHEET_NAME: "Results",
 
   // Also write status / found_in / duplicate_in_list columns directly to the
-  // right of your input data, on the same rows. Set to false to leave your
-  // input tab completely untouched.
+  // right of your input data, on the same rows. Re-used on later runs rather
+  // than appended again. Set to false to leave your input tab untouched.
   WRITE_STATUS_NEXT_TO_INPUT: true,
 
   // Scan Google Sheets in sub-folders of FOLDER_ID as well.
@@ -107,6 +110,10 @@ const PROP_CHECKPOINT_FILE = "DOMAIN_CLEANER_CHECKPOINT_FILE_ID";
 const PROP_RESUME_TRIGGER = "DOMAIN_CLEANER_RESUME_TRIGGER_ID";
 
 const CHECKPOINT_FILE_NAME = "domain-cleaner-checkpoint.json";
+
+// The columns this script adds. Kept in one place because they are both
+// written and recognised again on the next run.
+const STATUS_HEADERS = ["status", "found_in", "duplicate_in_list"];
 
 
 /* ============================================================================
@@ -207,7 +214,9 @@ function runCheck_() {
 
   const results = compareAgainstMatches_(input.rows, matches, checkpoint.files);
 
-  writeResultsSheet_(targetSs, results.rows);
+  if (CONFIG.WRITE_RESULTS_SHEET) {
+    writeResultsSheet_(targetSs, input, results.rows);
+  }
   if (CONFIG.WRITE_STATUS_NEXT_TO_INPUT) {
     writeStatusNextToInput_(input, results.rows);
   }
@@ -685,13 +694,26 @@ function readNewDomains_(ss) {
   const dataRows = lastRow - 1;
   const rows = [];
 
+  // The report copies your other columns across, so read the whole row when
+  // it is going to be written; otherwise read just the domain column.
+  const wide = CONFIG.WRITE_RESULTS_SHEET;
+  const readFrom = wide ? 1 : col + 1;
+  const readWidth = wide ? lastCol : 1;
+  const domainAt = wide ? col : 0;
+
   for (let offset = 0; offset < dataRows; offset += CONFIG.READ_CHUNK_ROWS) {
     const numRows = Math.min(CONFIG.READ_CHUNK_ROWS, dataRows - offset);
-    const values = sheet.getRange(2 + offset, col + 1, numRows, 1).getValues();
+    const values = sheet.getRange(2 + offset, readFrom, numRows, readWidth).getValues();
     for (let r = 0; r < values.length; r++) {
-      const raw = String(values[r][0] === null || values[r][0] === undefined ? "" : values[r][0]).trim();
+      const cell = values[r][domainAt];
+      const raw = String(cell === null || cell === undefined ? "" : cell).trim();
       if (!raw) continue; // blank cell / blank row
-      rows.push({ row: 2 + offset + r, raw: raw, domain: normalizeDomain_(raw) });
+      rows.push({
+        row: 2 + offset + r,
+        raw: raw,
+        domain: normalizeDomain_(raw),
+        cells: wide ? values[r] : null
+      });
     }
   }
 
@@ -700,8 +722,34 @@ function readNewDomains_(ss) {
     sheet: sheet,
     column: col + 1,
     headerName: String(headers[col]).trim(),
-    lastColumn: lastCol
+    headers: headers,
+    lastColumn: lastCol,
+    statusBlockAt: findStatusBlock_(headers)
   };
+}
+
+
+/**
+ * Finds the status / found_in / duplicate_in_list block this script wrote on a
+ * previous run, so those columns are overwritten instead of a fresh set being
+ * appended every time the check runs.
+ *
+ * @param {!Array<*>} headerRow
+ * @return {number} 0-based column of "status", or -1 if the block is not there.
+ */
+function findStatusBlock_(headerRow) {
+  for (let i = 0; i + STATUS_HEADERS.length <= headerRow.length; i++) {
+    let hit = true;
+    for (let j = 0; j < STATUS_HEADERS.length; j++) {
+      const h = headerRow[i + j];
+      if (String(h === null || h === undefined ? "" : h).trim().toLowerCase() !== STATUS_HEADERS[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return i;
+  }
+  return -1;
 }
 
 
@@ -842,27 +890,58 @@ function normalizeDomain_(value) {
  * ==========================================================================*/
 
 /**
- * Rewrites the results tab in the new-domains spreadsheet.
+ * Rewrites the results tab: every column from your input sheet, in its
+ * original order, followed by the verdict. Extra columns you keep beside the
+ * domains — company, contact, notes — come across untouched.
+ *
+ * Status columns left in the input by an earlier run are not copied, so the
+ * report does not accumulate a stale verdict beside the current one.
  *
  * @param {!Spreadsheet} ss
- * @param {!Array<!Array<*>>} rows
+ * @param {!Object} input Result of readNewDomains_.
+ * @param {!Array<!Array<*>>} rows Result rows, [sourceRow, raw, norm, status, foundIn, inList].
  */
-function writeResultsSheet_(ss, rows) {
+function writeResultsSheet_(ss, input, rows) {
   let sheet = ss.getSheetByName(CONFIG.RESULTS_SHEET_NAME);
   if (!sheet) sheet = ss.insertSheet(CONFIG.RESULTS_SHEET_NAME);
   sheet.clear();
 
-  const headers = ["source_row", "domain", "normalized_domain", "status", "found_in", "duplicate_in_list"];
+  // Which input columns to carry over: all of them, minus a previous verdict.
+  const carried = [];
+  for (let c = 0; c < input.headers.length; c++) {
+    const inOldBlock = input.statusBlockAt !== -1 &&
+                       c >= input.statusBlockAt &&
+                       c < input.statusBlockAt + STATUS_HEADERS.length;
+    if (!inOldBlock) carried.push(c);
+  }
+
+  const headers = carried.map(function (c) {
+    const h = String(input.headers[c] === null || input.headers[c] === undefined ? "" : input.headers[c]).trim();
+    return h || "column_" + (c + 1);
+  }).concat(["normalized_domain"], STATUS_HEADERS, ["source_row"]);
+
+  const grid = [];
+  for (let i = 0; i < rows.length; i++) {
+    const cells = input.rows[i].cells;
+    const out = [];
+    for (let c = 0; c < carried.length; c++) {
+      const v = cells[carried[c]];
+      out.push(v === null || v === undefined ? "" : v);
+    }
+    grid.push(out.concat([rows[i][2], rows[i][3], rows[i][4], rows[i][5], rows[i][0]]));
+  }
+
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold");
   sheet.setFrozenRows(1);
 
-  for (let offset = 0; offset < rows.length; offset += CONFIG.WRITE_CHUNK_ROWS) {
-    const chunk = rows.slice(offset, offset + CONFIG.WRITE_CHUNK_ROWS);
+  for (let offset = 0; offset < grid.length; offset += CONFIG.WRITE_CHUNK_ROWS) {
+    const chunk = grid.slice(offset, offset + CONFIG.WRITE_CHUNK_ROWS);
     sheet.getRange(2 + offset, 1, chunk.length, headers.length).setValues(chunk);
   }
 
   sheet.autoResizeColumns(1, headers.length);
-  Logger.log('Results written to the "' + CONFIG.RESULTS_SHEET_NAME + '" tab.');
+  Logger.log("Results written to the \"" + CONFIG.RESULTS_SHEET_NAME + '" tab (' +
+             carried.length + " of your columns carried across).");
 }
 
 
@@ -875,9 +954,11 @@ function writeResultsSheet_(ss, rows) {
  */
 function writeStatusNextToInput_(input, rows) {
   const sheet = input.sheet;
-  const firstCol = input.lastColumn + 1;
   const lastRow = sheet.getLastRow();
-  const headers = ["status", "found_in", "duplicate_in_list"];
+
+  // Overwrite the block from a previous run if it is there; only append when
+  // there is none, so repeated runs cannot pile up column after column.
+  const firstCol = input.statusBlockAt !== -1 ? input.statusBlockAt + 1 : input.lastColumn + 1;
 
   // Blank grid so rows with empty domain cells stay empty.
   const grid = [];
@@ -886,13 +967,14 @@ function writeStatusNextToInput_(input, rows) {
     grid[rows[i][0] - 2] = [rows[i][3], rows[i][4], rows[i][5]];
   }
 
-  sheet.getRange(1, firstCol, 1, headers.length).setValues([headers]).setFontWeight("bold");
+  sheet.getRange(1, firstCol, 1, STATUS_HEADERS.length).setValues([STATUS_HEADERS]).setFontWeight("bold");
   for (let offset = 0; offset < grid.length; offset += CONFIG.WRITE_CHUNK_ROWS) {
     const chunk = grid.slice(offset, offset + CONFIG.WRITE_CHUNK_ROWS);
-    sheet.getRange(2 + offset, firstCol, chunk.length, headers.length).setValues(chunk);
+    sheet.getRange(2 + offset, firstCol, chunk.length, STATUS_HEADERS.length).setValues(chunk);
   }
-  Logger.log("Status columns written next to the input data (columns " +
-             firstCol + "–" + (firstCol + headers.length - 1) + ").");
+  Logger.log("Status columns " + (input.statusBlockAt !== -1 ? "updated" : "added") +
+             " next to the input data (columns " + firstCol + "\u2013" +
+             (firstCol + STATUS_HEADERS.length - 1) + ").");
 }
 
 

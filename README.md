@@ -57,8 +57,9 @@ Other settings you can leave alone:
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `RESULTS_SHEET_NAME` | `"Results"` | Tab the full report is written to. Cleared and rewritten each run. |
-| `WRITE_STATUS_NEXT_TO_INPUT` | `true` | Also writes `status` / `found_in` / `duplicate_in_list` to the right of your input rows. Set to `false` to leave the input tab untouched. |
+| `WRITE_RESULTS_SHEET` | `true` | Write the full report to its own tab. Set to `false` if you only want the status columns added to your input sheet. |
+| `RESULTS_SHEET_NAME` | `"Results"` | Tab the report is written to. Cleared and rewritten each run. |
+| `WRITE_STATUS_NEXT_TO_INPUT` | `true` | Also writes `status` / `found_in` / `duplicate_in_list` to the right of your input rows, re-using those columns on later runs. Set to `false` to leave the input tab untouched. |
 | `INCLUDE_SUBFOLDERS` | `false` | Set to `true` to scan sub-folders of `FOLDER_ID` too. |
 | `RESUMABLE` | `false` | Turn on for folders too big to scan in one run — see [Big folders](#big-folders-200k500k-domains). |
 | `READ_CHUNK_ROWS` | `20000` | Rows per batch read. Lower it only if you hit memory errors. |
@@ -110,16 +111,48 @@ services.
 
 ## 5. How the output looks
 
-A **Results** tab, rewritten on every run:
+You get the output in two places, and either can be switched off.
 
-| source_row | domain | normalized_domain | status | found_in | duplicate_in_list |
+**A `Results` tab**, rewritten on every run. It carries **every column from your input
+sheet** across in its original order, so any extra data you keep beside the domains —
+company, contact, notes — travels with the verdict. Say your `Sheet1` looks like this:
+
+| Company | domain | Contact | Notes |
+| --- | --- | --- | --- |
+| ACME Ltd | https://example.com | Jane | call back |
+| Beta Inc | test.com | Bob | |
+
+The report comes out as:
+
+| Company | domain | Contact | Notes | normalized_domain | status | found_in | duplicate_in_list | source_row |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ACME Ltd | https://example.com | Jane | call back | example.com | DUPLICATE | Leads January, Apollo SaaS | YES — rows 2, 4 | 2 |
+| Beta Inc | test.com | Bob | | test.com | NEW | Not found | | 3 |
+
+A column with a blank header is carried across as `column_3`, `column_7` and so on, so
+nothing is silently dropped. `source_row` is the row it came from in your input sheet.
+
+**Status columns on your input sheet**, written to the right of your data and aligned
+row-for-row, when `WRITE_STATUS_NEXT_TO_INPUT` is on:
+
+| Company | domain | Contact | status | found_in | duplicate_in_list |
 | --- | --- | --- | --- | --- | --- |
-| 2 | https://example.com | example.com | DUPLICATE | Leads January, Apollo SaaS, Old Leads | YES — rows 2, 4 |
-| 3 | test.com | test.com | NEW | Not found | YES — rows 3, 5 |
-| 4 | www.example.com | example.com | DUPLICATE | Leads January, Apollo SaaS, Old Leads | YES — rows 2, 4 |
-| 5 | TEST.com/ | test.com | DUPLICATE IN LIST | Earlier row in this list | YES — rows 3, 5 |
-| 6 | ABC.com | abc.com | DUPLICATE | Apollo SaaS | |
-| 7 | garbage value | | INVALID | Not a valid domain | |
+| ACME Ltd | https://example.com | Jane | DUPLICATE | Leads January, Apollo SaaS | YES — rows 2, 4 |
+
+Run the check again and those three columns are **overwritten in place**, not appended a
+second time — so repeat runs never grow the sheet sideways. The report ignores them too,
+so an old verdict is never copied in beside the fresh one.
+
+Here is the full range of verdicts:
+
+| domain | normalized_domain | status | found_in | duplicate_in_list |
+| --- | --- | --- | --- | --- |
+| https://example.com | example.com | DUPLICATE | Leads January, Apollo SaaS, Old Leads | YES — rows 2, 4 |
+| test.com | test.com | NEW | Not found | YES — rows 3, 5 |
+| www.example.com | example.com | DUPLICATE | Leads January, Apollo SaaS, Old Leads | YES — rows 2, 4 |
+| TEST.com/ | test.com | DUPLICATE IN LIST | Earlier row in this list | YES — rows 3, 5 |
+| ABC.com | abc.com | DUPLICATE | Apollo SaaS | |
+| garbage value | | INVALID | Not a valid domain | |
 
 **Statuses**
 
@@ -133,9 +166,6 @@ A **Results** tab, rewritten on every run:
 `duplicate_in_list` is filled in on **all** rows sharing a normalized domain — including
 the first — so `example.com`, `www.example.com` and `https://example.com` are visibly
 the same domain.
-
-With `WRITE_STATUS_NEXT_TO_INPUT: true` the same three columns are also appended beside
-your input rows, aligned row-for-row.
 
 And a summary in the log (and as a toast):
 
